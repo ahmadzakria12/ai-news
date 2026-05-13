@@ -1,14 +1,27 @@
 """
 AI News Backend - FastAPI application with OpenAI Agents SDK
 """
+from contextlib import asynccontextmanager
+
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, FileResponse
 from pydantic import BaseModel
-from typing import Optional, List
+from typing import Optional, List, Tuple
 import os
+import asyncio
 from dotenv import load_dotenv
-from utils.helpers import generate_pdf_report, generate_voice_summary, generate_trend_graph
+
+from utils.helpers import (
+    generate_pdf_report,
+    generate_voice_summary,
+    generate_trend_graph,
+    safe_asset_path,
+    cleanup_old_generated_files,
+)
+from utils.guardrails import check_input, check_output
+from utils.session_store import InMemorySessionStore
+from utils.bilingual_tts import translate_english_to_urdu_for_tts
 
 from agents import (
     SEOAgent,
@@ -34,42 +47,64 @@ try:
 except Exception:
     pass  # Environment variables may already be set
 
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Startup/shutdown hooks (SRS: optional cleanup of generated assets)."""
+    try:
+        cleanup_old_generated_files(max_age_hours=24)
+    except Exception:
+        pass
+    yield
+
+
+frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
+is_production = os.getenv("ENVIRONMENT") == "production" or os.getenv("VERCEL") == "1"
+
+# CORS: default production = registered origins only (SRS). Set CORS_ALLOW_ALL=1 to allow "*".
+_extra_origins = [o.strip() for o in os.getenv("CORS_EXTRA_ORIGINS", "").split(",") if o.strip()]
+allowed_origins = list(
+    dict.fromkeys(
+        [
+            frontend_url,
+            "http://localhost:3000",
+            "http://127.0.0.1:3000",
+            "http://localhost:3001",
+            "http://127.0.0.1:3001",
+            *_extra_origins,
+        ]
+    )
+)
+_cors_allow_all = os.getenv("CORS_ALLOW_ALL", "").strip() == "1"
+
 app = FastAPI(
     title="AI News API",
     description="AI News Backend with OpenAI Agents SDK",
-    version="1.0.0"
+    version="1.0.0",
+    lifespan=lifespan,
 )
 
-# CORS middleware
-frontend_url = os.getenv("FRONTEND_URL", "http://localhost:3000")
-environment = os.getenv("ENVIRONMENT", "development")
-
-# Build allowed origins list
-allowed_origins = [
-    frontend_url,
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-]
-
-# CORS Configuration - Allow all origins for production
-# This ensures all Vercel preview and production domains work
-
-# Check if we're in production (Vercel deployment)
-is_production = os.getenv("ENVIRONMENT") == "production" or os.getenv("VERCEL") == "1"
-
-if is_production:
-    # Production: Allow all origins (Vercel uses different domains for previews)
+if is_production and not _cors_allow_all:
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],  # Allow all origins in production
-        allow_credentials=False,  # Must be False when using "*"
+        allow_origins=allowed_origins,
+        allow_credentials=True,
+        allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
+        allow_headers=["*"],
+        expose_headers=["*"],
+        max_age=3600,
+    )
+elif is_production and _cors_allow_all:
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=False,
         allow_methods=["GET", "POST", "PUT", "DELETE", "OPTIONS", "PATCH"],
         allow_headers=["*"],
         expose_headers=["*"],
         max_age=3600,
     )
 else:
-    # Development: Allow localhost and specific origins
     app.add_middleware(
         CORSMiddleware,
         allow_origins=allowed_origins,
@@ -130,6 +165,90 @@ class LiveNewsRequest(BaseModel):
     categories: Optional[List[str]] = None  # ["ai", "crypto", "politics", "health", "pakistan", "sports", "world"]
     session_id: Optional[str] = None
 
+
+def normalize_agent_key(name: str) -> str:
+    """Map SRS-style aliases to internal agent keys."""
+    n = (name or "").strip().lower()
+    return {
+        "research": "news_research",
+        "breaking": "breaking_news_alert",
+        "breaking_news": "breaking_news_alert",
+    }.get(n, n)
+
+
+def build_live_news_user_prompt(
+    categories: Optional[List[str]],
+) -> Tuple[str, List[str]]:
+    """Build user query + resolved category ids for live news (SRS category filters)."""
+    labels = {
+        "ai": "AI / machine learning / model releases / AI regulation",
+        "ai_tech": "AI & technology (AI/Tech)",
+        "tech": "Technology",
+        "crypto": "Cryptocurrency & blockchain",
+        "politics": "Politics & policy",
+        "health": "Health & medicine",
+        "pakistan": "Pakistan news",
+        "sports": "Sports",
+        "world": "International / world news",
+        "all": "Balanced headlines across major categories",
+    }
+    raw = [str(c).strip().lower() for c in (categories or []) if str(c).strip()]
+    if not raw or "all" in raw:
+        return (
+            "Topic scope: ALL / mixed categories. Provide a credible live-desk update across major beats "
+            "(include AI/Tech prominently when relevant). Follow the Live News Agent output format.",
+            ["all"],
+        )
+    resolved: List[str] = []
+    parts: List[str] = []
+    for c in raw:
+        key = c.replace(" ", "_").replace("/", "_")
+        if key == "ai-tech":
+            key = "ai_tech"
+        lbl = labels.get(key)
+        if lbl:
+            resolved.append(key)
+            parts.append(lbl)
+    if not parts:
+        return (
+            "Topic scope: AI / technology. Follow the Live News Agent output format.",
+            ["ai"],
+        )
+    text = (
+        "Topic scope for this request: "
+        + "; ".join(parts)
+        + ". Follow the Live News Agent output format with timestamps and source names."
+    )
+    return text, resolved
+
+
+def http_exc_from_agent_error(exc: Exception) -> HTTPException:
+    msg = str(exc)
+    low = msg.lower()
+    if "quota" in low or "429" in msg:
+        return HTTPException(status_code=402, detail=msg)
+    if "invalid" in low and "api" in low:
+        return HTTPException(status_code=401, detail=msg)
+    if "rate limit" in low:
+        return HTTPException(status_code=429, detail=msg)
+    if any(
+        x in low
+        for x in (
+            "timeout",
+            "connection",
+            "name resolution",
+            "unreachable",
+            "connecterror",
+            "temporarily unavailable",
+        )
+    ):
+        return HTTPException(
+            status_code=503,
+            detail="Upstream AI service unavailable. Please try again later.",
+        )
+    return HTTPException(status_code=500, detail=msg)
+
+
 # Initialize all agents
 seo_agent = SEOAgent()
 youtube_agent = YouTubeAgent()
@@ -142,7 +261,8 @@ news_summarizer = NewsSummarizerAgent()
 multi_agent_newsroom = MultiAgentNewsroomSystem()
 ultimate_ai_news = UltimateAINewsAgent()
 live_news_agent = LiveNewsAgent()
-agent_runner = AgentRunner()
+session_store = InMemorySessionStore()
+agent_runner = AgentRunner(session_store)
 
 @app.options("/{full_path:path}")
 async def options_handler(full_path: str):
@@ -163,12 +283,18 @@ async def root():
 
 @app.get("/health")
 async def health():
-    return {"status": "healthy"}
+    """RSS + optional NewsAPI; no OpenAI. Use this to confirm the running server is current."""
+    return {"status": "healthy", "live_news": "rss"}
 
 @app.post("/api/agent", response_model=AgentResponse)
 async def run_agent(request: AgentRequest):
     """Run a specific agent"""
     try:
+        ok, reason = check_input(request.query)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
+
+        agent_key = normalize_agent_key(request.agent_type)
         agent_map = {
             "seo": seo_agent,
             "youtube": youtube_agent,
@@ -182,40 +308,50 @@ async def run_agent(request: AgentRequest):
             "ultimate_ai_news": ultimate_ai_news,
             "live_news": live_news_agent,
         }
-        
-        if request.agent_type not in agent_map:
+
+        if agent_key not in agent_map:
             raise HTTPException(
                 status_code=400,
-                detail=f"Invalid agent type. Must be one of: {list(agent_map.keys())}"
+                detail=f"Invalid agent type. Must be one of: {sorted(agent_map.keys())}",
             )
-        
-        agent = agent_map[request.agent_type]
+
+        agent = agent_map[agent_key]
         result = await agent_runner.run_async(
             agent=agent,
             query=request.query,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=True,
         )
-        
+
+        out = result.final_output or ""
+        out_ok, out_reason = check_output(out)
+        if not out_ok:
+            raise HTTPException(status_code=400, detail=out_reason)
+
         return AgentResponse(
-            result=result.final_output,
+            result=out,
             session_id=result.session_id,
-            agent_type=request.agent_type
+            agent_type=request.agent_type,
         )
     except HTTPException:
         raise
     except Exception as e:
         import traceback
-        error_details = traceback.format_exc()
-        print(f"Error in run_agent: {error_details}")  # Log to console
-        raise HTTPException(status_code=500, detail=f"Internal server error: {str(e)}")
+
+        print(f"Error in run_agent: {traceback.format_exc()}")
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/news", response_model=NewsResponse)
 async def get_news(request: NewsRequest):
     """Get news from multiple agents"""
     try:
+        ok, reason = check_input(request.query)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
+
         agents_to_use = request.agents or ["seo", "youtube", "forbes", "web_search"]
         results = {}
-        
+
         agent_map = {
             "seo": seo_agent,
             "youtube": youtube_agent,
@@ -229,25 +365,36 @@ async def get_news(request: NewsRequest):
             "ultimate_ai_news": ultimate_ai_news,
             "live_news": live_news_agent,
         }
-        
+
         session_id = request.session_id or agent_runner.create_session_id()
-        
+
+        async def run_one(agent_label: str, agent_key: str):
+            agent = agent_map[agent_key]
+            result = await agent_runner.run_async(
+                agent=agent,
+                query=request.query,
+                session_id=session_id,
+                use_memory=False,
+            )
+            out = result.final_output or ""
+            out_ok, out_reason = check_output(out)
+            return agent_label, (out if out_ok else f"[Blocked] {out_reason}")
+
+        tasks = []
         for agent_name in agents_to_use:
-            if agent_name in agent_map:
-                agent = agent_map[agent_name]
-                result = await agent_runner.run_async(
-                    agent=agent,
-                    query=request.query,
-                    session_id=session_id
-                )
-                results[agent_name] = result.final_output
-        
-        return NewsResponse(
-            results=results,
-            session_id=session_id
-        )
+            key = normalize_agent_key(agent_name)
+            if key not in agent_map:
+                continue
+            tasks.append(run_one(agent_name, key))
+
+        pairs = await asyncio.gather(*tasks)
+        results = {label: text for label, text in pairs}
+
+        return NewsResponse(results=results, session_id=session_id)
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/daily-news")
 async def get_daily_news(request: DailyNewsRequest):
@@ -255,11 +402,15 @@ async def get_daily_news(request: DailyNewsRequest):
     try:
         topics = request.topics or ["ai", "crypto", "politics", "health", "pakistan", "sports"]
         query = f"Collect today's news on these topics: {', '.join(topics)}"
+        ok, reason = check_input(query)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
         
         result = await agent_runner.run_async(
             agent=daily_news_collector,
             query=query,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=False,
         )
         
         return {
@@ -267,19 +418,25 @@ async def get_daily_news(request: DailyNewsRequest):
             "session_id": result.session_id,
             "topics": topics
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/breaking-news")
 async def get_breaking_news(request: BreakingNewsRequest):
     """Get breaking news alerts"""
     try:
         query = request.query or "Check for breaking news and high-impact events"
+        ok, reason = check_input(query)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
         
         result = await agent_runner.run_async(
             agent=breaking_news_alert,
             query=query,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=False,
         )
         
         return {
@@ -287,17 +444,23 @@ async def get_breaking_news(request: BreakingNewsRequest):
             "session_id": result.session_id,
             "alert_type": "breaking_news"
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/research")
 async def research_topic(request: ResearchRequest):
     """Deep research on a specific topic"""
     try:
+        ok, reason = check_input(request.topic)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
         result = await agent_runner.run_async(
             agent=news_research,
             query=f"Research this topic in detail: {request.topic}",
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=False,
         )
         
         return {
@@ -305,19 +468,25 @@ async def research_topic(request: ResearchRequest):
             "session_id": result.session_id,
             "topic": request.topic
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/summarize")
 async def summarize_news(request: SummarizeRequest):
     """Create TLDR summaries of news content"""
     try:
+        ok, reason = check_input(request.content)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
         query = f"Create a {request.summary_type} summary of this content:\n\n{request.content}"
         
         result = await agent_runner.run_async(
             agent=news_summarizer,
             query=query,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=False,
         )
         
         return {
@@ -325,17 +494,23 @@ async def summarize_news(request: SummarizeRequest):
             "session_id": result.session_id,
             "summary_type": request.summary_type
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/newsroom")
 async def newsroom_system(request: NewsroomRequest):
     """Multi-agent newsroom system"""
     try:
+        ok, reason = check_input(request.query)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
         result = await agent_runner.run_async(
             agent=multi_agent_newsroom,
             query=request.query,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=False,
         )
         
         return {
@@ -343,114 +518,159 @@ async def newsroom_system(request: NewsroomRequest):
             "session_id": result.session_id,
             "system": "multi_agent_newsroom"
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.post("/api/ultimate-news")
 async def ultimate_news_agent(request: UltimateNewsRequest):
     """Ultimate AI News Agent - All-in-One"""
     try:
+        ok, reason = check_input(request.query)
+        if not ok:
+            raise HTTPException(status_code=400, detail=reason)
         features = request.features or ["daily_collection", "summaries", "trends"]
-        language_note = f" (Respond in {request.language})" if request.language != "english" else ""
-        
+        lang = (request.language or "english").strip().lower()
+        # REQ-SF5-4: written digest stays English unless user asks for Urdu; bilingual = English text + Urdu audio later
+        if lang == "urdu":
+            language_note = (
+                " Write the entire news digest in Urdu (Nastaliq-friendly plain text, no mixed English except proper nouns where needed)."
+            )
+        elif lang == "bilingual":
+            language_note = (
+                " Write the entire news digest in English only. Do not include Urdu script in the written output. "
+                "(Bilingual delivery: Urdu will be provided separately as audio for Urdu-speaking users.)"
+            )
+        else:
+            language_note = " Write the entire news digest in English only."
+
         query = f"{request.query}\n\nUse features: {', '.join(features)}{language_note}"
         
         result = await agent_runner.run_async(
             agent=ultimate_ai_news,
             query=query,
-            session_id=request.session_id
+            session_id=request.session_id,
+            use_memory=False,
         )
-        
+
+        out_text = result.final_output or ""
+        out_ok, out_reason = check_output(out_text)
+        if not out_ok:
+            raise HTTPException(status_code=400, detail=out_reason)
+
         response_data = {
-            "result": result.final_output,
+            "result": out_text,
             "session_id": result.session_id,
             "features": features,
-            "language": request.language
+            "language": request.language,
         }
-        
-        # Generate PDF if requested
+
         if "pdf_report" in features:
-            pdf_path = generate_pdf_report(result.final_output, title="AI News Report")
-            response_data["pdf_path"] = pdf_path
-        
-        # Generate voice summary if requested
+            pdf_path = generate_pdf_report(out_text, title="AI News Report")
+            response_data["pdf_path"] = os.path.basename(pdf_path)
+
         if "voice_summary" in features:
-            voice_path = generate_voice_summary(result.final_output, language=request.language)
-            response_data["voice_path"] = voice_path
-        
-        # Generate trend graph if requested
+            try:
+                if lang == "bilingual":
+                    # REQ-SF5-2 / REQ-SF5-3: English digest + Urdu MP3 (ur)
+                    urdu_for_tts = await translate_english_to_urdu_for_tts(out_text)
+                    voice_path = generate_voice_summary(
+                        urdu_for_tts, language="urdu"
+                    )
+                    response_data["voice_path"] = os.path.basename(voice_path)
+                    response_data["voice_audio_language"] = "ur"
+                else:
+                    voice_path = generate_voice_summary(out_text, language=lang)
+                    response_data["voice_path"] = os.path.basename(voice_path)
+                    response_data["voice_audio_language"] = (
+                        "ur" if lang == "urdu" else "en"
+                    )
+            except Exception as te:
+                response_data["voice_error"] = str(te)
+
         if "trend_graph" in features:
-            # Example trend data - in production, this would come from actual analytics
             trend_data = {
                 "dates": ["2024-01-01", "2024-01-02", "2024-01-03", "2024-01-04", "2024-01-05"],
-                "values": [10, 15, 13, 17, 20]
+                "values": [10, 15, 13, 17, 20],
             }
             graph_path = generate_trend_graph(trend_data)
-            response_data["graph_path"] = graph_path
-        
+            response_data["graph_path"] = os.path.basename(graph_path)
+
         return response_data
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        raise http_exc_from_agent_error(e)
 
 @app.get("/api/download-pdf/{filename}")
 async def download_pdf(filename: str):
     """Download generated PDF file"""
-    file_path = f"reports/{filename}"
+    try:
+        file_path, base = safe_asset_path("reports", filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
     if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="application/pdf", filename=filename)
+        return FileResponse(file_path, media_type="application/pdf", filename=base)
     raise HTTPException(status_code=404, detail="PDF file not found")
+
 
 @app.get("/api/download-audio/{filename}")
 async def download_audio(filename: str):
     """Download generated audio file"""
-    file_path = f"audio/{filename}"
+    try:
+        file_path, base = safe_asset_path("audio", filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
     if os.path.exists(file_path):
-        return FileResponse(file_path, media_type="audio/mpeg", filename=filename)
+        return FileResponse(file_path, media_type="audio/mpeg", filename=base)
     raise HTTPException(status_code=404, detail="Audio file not found")
+
+
+@app.get("/api/download-graph/{filename}")
+async def download_graph(filename: str):
+    """Download generated PNG trend graph"""
+    try:
+        file_path, base = safe_asset_path("graphs", filename)
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Invalid filename")
+    if os.path.exists(file_path):
+        return FileResponse(file_path, media_type="image/png", filename=base)
+    raise HTTPException(status_code=404, detail="Graph file not found")
 
 @app.post("/api/live-news")
 async def get_live_news(request: LiveNewsRequest):
-    """Get live news updates in real-time - AI news only"""
+    """Headlines from NewsAPI.org when ``NEWS_API_KEY`` is set (``urlToImage``); else RSS. Never OpenAI."""
+    import asyncio
+    import traceback
+
+    from utils.rss_live_news import fetch_live_news_with_meta
+
     try:
-        import traceback
-        # Force AI category only - ignore other categories
-        query = "Get the latest AI (Artificial Intelligence) related news updates from the web. Search for real AI news from sources like TechCrunch, The Verge, MIT Technology Review, Reuters Tech, and BBC Technology. Focus ONLY on: Machine Learning, Deep Learning, Neural Networks, AI Research, AI Companies, AI Tools, AI Ethics, AI Regulations, AI Breakthroughs, and AI Applications. Provide the news in the readable format as specified in your instructions. Include actual headlines, summaries, sources, URLs, and timestamps. Filter out any non-AI content. DO NOT mention JSON format - directly provide the news."
-        
-        result = await agent_runner.run_async(
-            agent=live_news_agent,
-            query=query,
-            session_id=request.session_id
+        _, resolved_categories = build_live_news_user_prompt(request.categories)
+        items, provider = await asyncio.to_thread(
+            fetch_live_news_with_meta,
+            resolved_categories,
+            10,
+            28,
         )
-        
+        sid = request.session_id or ""
         return {
-            "result": result.final_output,
-            "session_id": result.session_id,
-            "categories": ["ai"],  # Always AI only
-            "update_time": "live"
+            "result": "",
+            "items": items,
+            "session_id": sid,
+            "categories": resolved_categories,
+            "update_time": "live",
+            "provider": provider,
         }
-    except HTTPException:
-        raise
     except Exception as e:
-        import traceback
         error_details = traceback.format_exc()
         error_message = str(e)
-        
-        # Check for quota errors and return appropriate status code
-        if "quota" in error_message.lower() or "429" in error_message:
-            print(f"Quota error in /api/live-news: {error_message}\n{error_details}")
-            raise HTTPException(
-                status_code=402,  # Payment Required
-                detail=error_message
-            )
-        elif "invalid" in error_message.lower() and "api" in error_message.lower():
-            print(f"API key error in /api/live-news: {error_message}\n{error_details}")
-            raise HTTPException(
-                status_code=401,  # Unauthorized
-                detail=error_message
-            )
-        else:
-            print(f"Error in /api/live-news: {error_message}\n{error_details}")
-            raise HTTPException(status_code=500, detail=f"Internal Server Error: {error_message}")
+        print(f"Error in /api/live-news (RSS): {error_message}\n{error_details}")
+        raise HTTPException(
+            status_code=503,
+            detail="Could not load live news feeds. Check your network connection and try again.",
+        )
 
 if __name__ == "__main__":
     import uvicorn

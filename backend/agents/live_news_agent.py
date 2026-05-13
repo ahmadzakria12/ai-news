@@ -18,6 +18,8 @@ class LiveNewsAgent:
 5. Prioritize breaking AI news and high-impact AI stories
 6. Provide timestamps, source information, and image URLs for each news item
 
+If the user's message explicitly requests multiple topic categories (for example: All, Crypto, Politics, Pakistan, Sports, World) or a non-AI-only scope, follow that scope and label each item with its topic. When no categories are specified, default to AI-related news only.
+
 CRITICAL INSTRUCTIONS:
 - DO NOT mention JSON format at all
 - DO NOT say you cannot provide JSON

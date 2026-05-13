@@ -4,6 +4,7 @@ import { useState, useRef, useEffect } from "react";
 import { motion, AnimatePresence } from "motion/react";
 import { Send, Bot, User, Loader2, Sparkles } from "lucide-react";
 import { runAgent, AgentResponse } from "@/lib/api";
+import { useToast } from "@/components/Toast";
 
 interface Message {
   id: string;
@@ -19,6 +20,7 @@ interface ChatBotProps {
 }
 
 export function ChatBot({ agentType, agentName, agentDescription }: ChatBotProps) {
+  const { showToast } = useToast();
   const [messages, setMessages] = useState<Message[]>([]);
   const [input, setInput] = useState("");
   const [isLoading, setIsLoading] = useState(false);
@@ -69,10 +71,13 @@ export function ChatBot({ agentType, agentName, agentDescription }: ChatBotProps
       setMessages((prev) => [...prev, assistantMessage]);
     } catch (error) {
       console.error("Error sending message:", error);
+      const detail =
+        error instanceof Error ? error.message : "Please try again.";
+      showToast(detail, "error");
       const errorMessage: Message = {
         id: (Date.now() + 1).toString(),
         role: "assistant",
-        content: "Sorry, I encountered an error. Please try again.",
+        content: `Sorry, something went wrong: ${detail}`,
         timestamp: new Date(),
       };
       setMessages((prev) => [...prev, errorMessage]);

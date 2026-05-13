@@ -89,17 +89,6 @@ h1, h2, h3, h4, h5, h6 {
   background: #3a3a55; 
 }
 
-/* Hide default cursor on desktop when custom cursor is active */
-@media (min-width: 768px) {
-  * {
-    cursor: none !important;
-  }
-
-  a, button, input, textarea, select, [role="button"] {
-    cursor: none !important;
-  }
-}
-
 /* Smooth scrolling */
 html {
   scroll-behavior: smooth;

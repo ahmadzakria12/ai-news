@@ -2,7 +2,7 @@
 Base classes for OpenAI Agents SDK
 Using OpenAI SDK directly with a simple Agent wrapper
 """
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from openai import OpenAI, AsyncOpenAI
 import os
 
@@ -65,16 +65,21 @@ class Runner:
     """Simple Runner for executing agents"""
     
     @staticmethod
-    async def run(agent: Agent, query: str) -> Any:
-        """Run an agent asynchronously"""
+    async def run(agent: Agent, query: str, history: Optional[List[dict]] = None) -> Any:
+        """Run an agent asynchronously. Optional history: list of {role, content} user/assistant turns."""
         try:
             async_client = get_async_client()
+            messages: List[dict] = [{"role": "system", "content": agent.instructions}]
+            if history:
+                for msg in history:
+                    r = msg.get("role")
+                    c = msg.get("content")
+                    if r in ("user", "assistant") and isinstance(c, str) and c.strip():
+                        messages.append({"role": r, "content": c[:12000]})
+            messages.append({"role": "user", "content": query})
             response = await async_client.chat.completions.create(
                 model=agent.model,
-                messages=[
-                    {"role": "system", "content": agent.instructions},
-                    {"role": "user", "content": query}
-                ],
+                messages=messages,
                 temperature=0.7
             )
             
@@ -98,16 +103,21 @@ class Runner:
                 raise Exception(f"Error running agent: {str(e)}")
     
     @staticmethod
-    def run_sync(agent: Agent, query: str) -> Any:
-        """Run an agent synchronously"""
+    def run_sync(agent: Agent, query: str, history: Optional[List[dict]] = None) -> Any:
+        """Run an agent synchronously."""
         try:
             client = get_client()
+            messages: List[dict] = [{"role": "system", "content": agent.instructions}]
+            if history:
+                for msg in history:
+                    r = msg.get("role")
+                    c = msg.get("content")
+                    if r in ("user", "assistant") and isinstance(c, str) and c.strip():
+                        messages.append({"role": r, "content": c[:12000]})
+            messages.append({"role": "user", "content": query})
             response = client.chat.completions.create(
                 model=agent.model,
-                messages=[
-                    {"role": "system", "content": agent.instructions},
-                    {"role": "user", "content": query}
-                ],
+                messages=messages,
                 temperature=0.7
             )
             

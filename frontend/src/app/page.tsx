@@ -6,6 +6,8 @@ import { StatsSection } from "@/components/StatsSection";
 import { FeaturesSection } from "@/components/FeaturesSection";
 import { AgentsGrid } from "@/components/AgentsGrid";
 import { LiveNewsSection } from "@/components/LiveNewsSection";
+import { MultiAgentNewsPanel } from "@/components/MultiAgentNewsPanel";
+import { UltimateNewsPanel } from "@/components/UltimateNewsPanel";
 import { PricingSection } from "@/components/PricingSection";
 import { TestimonialsSection } from "@/components/TestimonialsSection";
 import { CTASection } from "@/components/CTASection";
@@ -19,7 +21,9 @@ export default function Home() {
       <main className="relative z-10">
         <HeroSection />
         <StatsSection />
+        <MultiAgentNewsPanel />
         <LiveNewsSection />
+        <UltimateNewsPanel />
         <FeaturesSection />
         <AgentsGrid />
         <PricingSection />

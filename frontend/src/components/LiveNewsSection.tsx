@@ -1,23 +1,56 @@
 "use client";
 
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import { motion } from "motion/react";
-import { Radio, RefreshCw, Clock, TrendingUp, ExternalLink } from "lucide-react";
-import { getLiveNews, LiveNewsResponse } from "@/lib/api";
-import { ParallaxElement } from "./ParallaxElement";
-import Image from "next/image";
+import { Radio, RefreshCw, Clock } from "lucide-react";
+import { getLiveNews, LiveNewsItem } from "@/lib/api";
 
-interface NewsItem {
-  title: string;
-  summary: string;
-  source: string;
-  url: string;
-  image_url?: string;
-  time: string;
+const LIVE_FILTERS: { key: string; label: string }[] = [
+  { key: "all", label: "All" },
+  { key: "ai_tech", label: "AI/Tech" },
+  { key: "crypto", label: "Crypto" },
+  { key: "politics", label: "Politics" },
+  { key: "health", label: "Health" },
+  { key: "pakistan", label: "Pakistan" },
+  { key: "sports", label: "Sports" },
+  { key: "world", label: "World" },
+];
+
+type NewsItem = LiveNewsItem;
+
+function NewsThumb({
+  imageUrl,
+  className,
+}: {
+  imageUrl?: string | null;
+  className: string;
+}) {
+  const [failed, setFailed] = useState(false);
+  if (!imageUrl || failed) {
+    return (
+      <div
+        className={`${className} bg-gray-200 flex items-center justify-center text-gray-500 text-xs font-medium text-center px-1`}
+        aria-hidden
+      >
+        No image
+      </div>
+    );
+  }
+  return (
+    <div className={`${className} relative overflow-hidden bg-gray-200`}>
+      <img
+        src={imageUrl}
+        alt=""
+        className="absolute inset-0 w-full h-full object-cover"
+        loading="lazy"
+        referrerPolicy="no-referrer-when-downgrade"
+        onError={() => setFailed(true)}
+      />
+    </div>
+  );
 }
 
 export const LiveNewsSection = () => {
-  const [news, setNews] = useState<LiveNewsResponse | null>(null);
   const [parsedNews, setParsedNews] = useState<{
     breaking: NewsItem[];
     updates: NewsItem[];
@@ -26,6 +59,7 @@ export const LiveNewsSection = () => {
   const [loading, setLoading] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
   const [autoRefresh, setAutoRefresh] = useState(true);
+  const [category, setCategory] = useState<string>("all");
 
   const parseNewsResponse = (response: string) => {
     try {
@@ -88,7 +122,6 @@ export const LiveNewsSection = () => {
               summary: summary || 'Breaking AI news update',
               source: source,
               url: url,
-              image_url: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=800&h=600&fit=crop",
               time: time
             });
           }
@@ -151,7 +184,6 @@ export const LiveNewsSection = () => {
               summary: summary || 'Latest AI news update',
               source: source,
               url: url,
-              image_url: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=600&h=400&fit=crop",
               time: time
             });
           }
@@ -175,7 +207,6 @@ export const LiveNewsSection = () => {
               summary: match[2].trim().substring(0, 150),
               source: match[3].trim() || 'AI News Desk',
               url: match[4].trim() || '#',
-              image_url: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=400&h=400&fit=crop",
               time: 'Today'
             });
           } else {
@@ -190,7 +221,6 @@ export const LiveNewsSection = () => {
                   summary: 'Latest AI development',
                   source: 'AI News Desk',
                   url: '#',
-                  image_url: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=400&h=400&fit=crop",
                   time: 'Today'
                 });
               }
@@ -218,7 +248,6 @@ export const LiveNewsSection = () => {
               summary: line.length > 100 ? line.substring(100, 250) : 'Latest AI development',
               source: 'AI News Desk',
               url: '#',
-              image_url: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=600&h=400&fit=crop",
               time: 'Just now'
             });
           }
@@ -232,13 +261,40 @@ export const LiveNewsSection = () => {
     }
   };
 
-  const fetchNews = async () => {
+  const fetchNews = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await getLiveNews(["ai"]); // Always AI only
-      setNews(response);
-      const parsed = parseNewsResponse(response.result);
-      setParsedNews(parsed);
+      const categories = category === "all" ? ["all"] : [category];
+      const response = await getLiveNews(categories);
+
+      if (response.items && response.items.length > 0) {
+        const it = response.items;
+        setParsedNews({
+          breaking: it.slice(0, 3),
+          updates: it.slice(3, 11),
+          highlights: it.slice(11, 20),
+        });
+      } else if (response.result?.trim()) {
+        setParsedNews(parseNewsResponse(response.result));
+      } else {
+        const hint =
+          response.provider === "empty"
+            ? "No headlines returned. Set NEWS_API_KEY in backend/.env for NewsAPI.org (title + image), or check your network."
+            : "No headlines right now. Try Refresh or another category.";
+        setParsedNews({
+          breaking: [],
+          updates: [
+            {
+              title: "No stories yet",
+              summary: hint,
+              source: "System",
+              url: "#",
+              time: "Now",
+            },
+          ],
+          highlights: [],
+        });
+      }
       setLastUpdate(new Date());
     } catch (error: any) {
       console.error("Error fetching live news:", error);
@@ -247,9 +303,14 @@ export const LiveNewsSection = () => {
       
       // Handle specific error cases
       if (errorMessage.includes("quota") || errorMessage.includes("429")) {
-        errorMessage = "OpenAI API quota exceeded. Please add credits to your OpenAI account at https://platform.openai.com/account/billing";
-      } else if (errorMessage.includes("Invalid") && errorMessage.includes("API")) {
-        errorMessage = "Invalid OpenAI API key. Please check your backend configuration.";
+        errorMessage =
+          "OpenAI API quota exceeded. Please add credits to your OpenAI account at https://platform.openai.com/account/billing";
+      } else if (
+        /Invalid OpenAI API key|invalid_api_key/i.test(errorMessage) &&
+        /running agent|Error running agent/i.test(errorMessage)
+      ) {
+        errorMessage =
+          "This error comes from an OLD backend that still used OpenAI for Live News. Stop every uvicorn/python on port 8000, then start the backend again from the backend folder. Open http://127.0.0.1:8000/health — you must see \"live_news\":\"rss\". Live News uses NewsAPI + RSS only and does not need OpenAI.";
       }
       
       // Show error in UI instead of alert
@@ -260,7 +321,6 @@ export const LiveNewsSection = () => {
           summary: errorMessage,
           source: "System",
           url: "#",
-          image_url: "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=600&h=400&fit=crop",
           time: "Now"
         }],
         highlights: []
@@ -268,11 +328,11 @@ export const LiveNewsSection = () => {
     } finally {
       setLoading(false);
     }
-  };
+  }, [category]);
 
   useEffect(() => {
     fetchNews();
-  }, []);
+  }, [fetchNews]);
 
   useEffect(() => {
     if (!autoRefresh) return;
@@ -282,7 +342,7 @@ export const LiveNewsSection = () => {
     }, 60000); // Refresh every 60 seconds
 
     return () => clearInterval(interval);
-  }, [autoRefresh]);
+  }, [autoRefresh, fetchNews]);
 
   const formatTime = (date: Date) => {
     return date.toLocaleTimeString("en-US", {
@@ -296,25 +356,52 @@ export const LiveNewsSection = () => {
     <section id="live-news" className="py-12 bg-gray-50 relative z-10">
       <div className="max-w-7xl mx-auto px-6">
         {/* Header */}
-        <ParallaxElement speed={0.1} direction="vertical">
-          <div className="flex flex-col md:flex-row items-start md:items-center justify-between mb-12 gap-6">
+        <div className="flex flex-col md:flex-row items-start md:items-center justify-between mb-12 gap-6">
             <div>
               <div className="inline-flex items-center gap-2 px-3 py-1 bg-red-600 text-white text-xs font-bold mb-3">
                 <Radio className="w-3 h-3 animate-pulse" />
                 LIVE
               </div>
               <h2 className="text-4xl md:text-5xl font-bold text-gray-900 mb-3">
-                AI News
+                Live headlines
               </h2>
-              <p className="text-gray-600 text-base max-w-2xl">
-                Latest artificial intelligence news, research, and developments from around the world.
-              </p>
             </div>
 
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2 text-sm text-gray-600">
-                <Clock className="w-4 h-4" />
-                {lastUpdate ? `Last updated: ${formatTime(lastUpdate)}` : "Not updated yet"}
+            <div className="flex flex-col items-end gap-3">
+              <div className="flex flex-wrap justify-end gap-2 max-w-xl">
+                {LIVE_FILTERS.map((f) => (
+                  <button
+                    key={f.key}
+                    type="button"
+                    onClick={() => setCategory(f.key)}
+                    className={`px-3 py-1 text-xs font-semibold border transition-colors ${
+                      category === f.key
+                        ? "bg-gray-900 text-white border-gray-900"
+                        : "bg-white text-gray-800 border-gray-200 hover:border-gray-400"
+                    }`}
+                  >
+                    {f.label}
+                  </button>
+                ))}
+              </div>
+              <div className="flex items-center gap-3 text-sm text-gray-600">
+                {autoRefresh ? (
+                  <span className="inline-flex items-center gap-2 text-emerald-700">
+                    <span className="relative flex h-2.5 w-2.5">
+                      <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-500 opacity-75" />
+                      <span className="relative inline-flex rounded-full h-2.5 w-2.5 bg-emerald-600" />
+                    </span>
+                    Live auto-refresh on
+                  </span>
+                ) : (
+                  <span className="text-gray-500">Live auto-refresh off</span>
+                )}
+                <span className="inline-flex items-center gap-2">
+                  <Clock className="w-4 h-4" />
+                  {lastUpdate
+                    ? `Last updated: ${formatTime(lastUpdate)}`
+                    : "Not updated yet"}
+                </span>
               </div>
               <button
                 onClick={fetchNews}
@@ -325,17 +412,15 @@ export const LiveNewsSection = () => {
                 Refresh
               </button>
             </div>
-          </div>
-        </ParallaxElement>
-
+        </div>
 
         {/* News Content - BBC Style Layout */}
-        <ParallaxElement speed={0.2} direction="both">
+        <div>
           {loading && !parsedNews ? (
             <div className="bg-white rounded-lg p-8 min-h-[400px] flex items-center justify-center">
               <div className="text-center">
                 <RefreshCw className="w-12 h-12 text-gray-400 animate-spin mx-auto mb-4" />
-                <p className="text-gray-600">Fetching latest AI news...</p>
+                <p className="text-gray-600">Fetching latest headlines…</p>
               </div>
             </div>
           ) : parsedNews ? (
@@ -344,7 +429,7 @@ export const LiveNewsSection = () => {
               {parsedNews.breaking.length > 0 && (
                 <div className="border-b border-gray-200">
                   <div className="bg-red-600 text-white px-4 py-2 text-sm font-semibold">
-                    BREAKING NEWS
+                    FEATURED HEADLINES
                   </div>
                   <div className="grid grid-cols-1 md:grid-cols-3 gap-4 p-6">
                     {parsedNews.breaking.slice(0, 1).map((item, i) => (
@@ -355,13 +440,9 @@ export const LiveNewsSection = () => {
                         className="md:col-span-2"
                       >
                         <div className="relative w-full h-64 md:h-80 mb-4 rounded overflow-hidden bg-gray-200">
-                          <img
-                            src={item.image_url || "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=1200&h=800&fit=crop"}
-                            alt={item.title}
-                            className="w-full h-full object-cover"
-                            onError={(e) => {
-                              (e.target as HTMLImageElement).src = "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=1200&h=800&fit=crop";
-                            }}
+                          <NewsThumb
+                            imageUrl={item.image_url}
+                            className="w-full h-full"
                           />
                         </div>
                         <h2 className="text-2xl md:text-3xl font-bold text-gray-900 mb-3 leading-tight">
@@ -392,13 +473,9 @@ export const LiveNewsSection = () => {
                         >
                           <div className="flex gap-3">
                             <div className="relative w-24 h-24 flex-shrink-0 rounded overflow-hidden bg-gray-200">
-                              <img
-                                src={item.image_url || "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=300&h=300&fit=crop"}
-                                alt={item.title}
-                                className="w-full h-full object-cover"
-                                onError={(e) => {
-                                  (e.target as HTMLImageElement).src = "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=300&h=300&fit=crop";
-                                }}
+                              <NewsThumb
+                                imageUrl={item.image_url}
+                                className="w-full h-full"
                               />
                             </div>
                             <div className="flex-1 min-w-0">
@@ -423,7 +500,7 @@ export const LiveNewsSection = () => {
               {parsedNews.updates.length > 0 && (
                 <div className="p-6 border-b border-gray-200">
                   <h2 className="text-2xl font-bold text-gray-900 mb-6 pb-3 border-b-2 border-gray-900">
-                    Latest AI News
+                    Latest stories
                   </h2>
                   <div className="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6">
                     {parsedNews.updates.map((item, i) => (
@@ -435,13 +512,9 @@ export const LiveNewsSection = () => {
                         className="group"
                       >
                         <div className="relative w-full h-48 mb-3 rounded overflow-hidden bg-gray-200">
-                          <img
-                            src={item.image_url || "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=600&h=400&fit=crop"}
-                            alt={item.title}
-                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                            onError={(e) => {
-                              (e.target as HTMLImageElement).src = "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=600&h=400&fit=crop";
-                            }}
+                          <NewsThumb
+                            imageUrl={item.image_url}
+                            className="w-full h-full"
                           />
                         </div>
                         <h3 className="text-base font-bold text-gray-900 mb-2 line-clamp-2 leading-tight group-hover:text-red-600 transition-colors">
@@ -478,13 +551,9 @@ export const LiveNewsSection = () => {
                         className="flex gap-4 group"
                       >
                         <div className="relative w-32 h-32 flex-shrink-0 rounded overflow-hidden bg-gray-200">
-                          <img
-                            src={item.image_url || "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=400&h=400&fit=crop"}
-                            alt={item.title}
-                            className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-300"
-                            onError={(e) => {
-                              (e.target as HTMLImageElement).src = "https://images.unsplash.com/photo-1677442136019-21780ecad995?w=400&h=400&fit=crop";
-                            }}
+                          <NewsThumb
+                            imageUrl={item.image_url}
+                            className="w-full h-full"
                           />
                         </div>
                         <div className="flex-1 min-w-0">
@@ -508,18 +577,18 @@ export const LiveNewsSection = () => {
 
               {parsedNews.breaking.length === 0 && parsedNews.updates.length === 0 && parsedNews.highlights.length === 0 && (
                 <div className="p-8 text-center text-gray-600">
-                  <p>No AI news available. Click refresh to fetch latest updates.</p>
+                  <p>No headlines available for this category. Try another filter or refresh.</p>
                 </div>
               )}
             </div>
           ) : (
             <div className="bg-white rounded-lg p-8 min-h-[400px] flex items-center justify-center">
               <div className="text-center text-gray-600">
-                <p>No news available. Click refresh to fetch latest AI news updates.</p>
+                <p>No headlines available. Click refresh to try again.</p>
               </div>
             </div>
           )}
-        </ParallaxElement>
+        </div>
 
         {/* Auto-refresh Toggle */}
         <div className="mt-6 flex items-center justify-center gap-2">
