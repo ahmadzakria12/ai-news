@@ -58,7 +58,7 @@ export const LiveNewsSection = () => {
   } | null>(null);
   const [loading, setLoading] = useState(false);
   const [lastUpdate, setLastUpdate] = useState<Date | null>(null);
-  const [autoRefresh, setAutoRefresh] = useState(true);
+  const [autoRefresh, setAutoRefresh] = useState(false);
   const [category, setCategory] = useState<string>("all");
 
   const parseNewsResponse = (response: string) => {
